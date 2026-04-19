@@ -25,8 +25,12 @@ from backtesting.lib import crossover
 warnings.filterwarnings("ignore")
 
 IS_MAC = platform.system() == "Darwin"
-if not IS_MAC:
+try:
     import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    MT5_AVAILABLE = False
+    IS_MAC = True  # treat as no-MT5 environment
 
 # ═══════════════════════════════════════════════════════
 #  CONFIG
@@ -39,7 +43,12 @@ INITIAL_CASH = 10_000
 LOT_SIZE = 0.1          # contract size used for pip-value maths
 SL_PIPS = 15
 TP_PIPS = 30           # 1:2 R:R
-PIP_SIZE = 0.10         # Gold: 1 pip = $0.10
+PIP_SIZE = 0.10         # Gold: 1 pip = $0.10 price move
+
+# Old script had pip_value = 1.0 USD per pip per trade (LOT_SIZE=1)
+# TRADE_SIZE in backtesting.py = pip_value / pip_size = 1.0 / 0.10 = 10 units
+# This gives: WIN = 10 * (30*0.10) = +$30  |  LOSS = 10 * (15*0.10) = -$15  (identical to old)
+PIP_VALUE_PER_PIP = 1.0     # USD per pip (matches old PIP_VALUE['XAUUSD'])
 
 CACHE_FOLDER = "cache_data"
 os.makedirs(CACHE_FOLDER, exist_ok=True)
@@ -227,6 +236,16 @@ class HeatMapStrategy(Strategy):
     tp_pips = TP_PIPS
     pip_sz = PIP_SIZE
 
+    # ── FIX 1: Fixed trade size to match old script's pip_value system ──
+    # Old script: WIN = TP_PIPS * pip_value = 30 * 1.0 = $30
+    #             LOSS = SL_PIPS * pip_value = 15 * 1.0 = $15
+    # backtesting.py: PnL = size * price_change
+    #   price_change_win  = TP_PIPS * pip_sz = 30 * 0.10 = 3.0
+    #   price_change_loss = SL_PIPS * pip_sz = 15 * 0.10 = 1.5
+    #   → size = pip_value / pip_sz = 1.0 / 0.10 = 10 units
+    #   Verify: 10 * 3.0 = $30 WIN ✓  |  10 * 1.5 = $15 LOSS ✓
+    TRADE_SIZE = int(PIP_VALUE_PER_PIP / PIP_SIZE)  # = 10
+
     def init(self):
         close = pd.Series(self.data.Close, index=self.data.index)
         high = pd.Series(self.data.High,  index=self.data.index)
@@ -282,13 +301,33 @@ class HeatMapStrategy(Strategy):
             return (s / (s.rolling(20).mean() + 1e-10)).values
         self.vol_ratio = self.I(_vol_ratio, vol, name="VolRatio")
 
+        # ── FIX 2: Cooldown counter (matches old script's 3-bar cooldown) ──
+        self._cooldown = 0
+        self._prev_closed = 0  # tracks number of closed trades to detect new closures
+
     def next(self):
         # Require minimum bars for indicators to warm up
         if len(self.data) < 210:
             return
 
+        # ── FIX 2: Enforce 3-bar cooldown after every closed trade ──
+        if self._cooldown > 0:
+            self._cooldown -= 1
+            return
+
+        # Detect a freshly closed trade: closed_trades count just increased
+        n_closed = len(self.closed_trades)
+        if n_closed > self._prev_closed:
+            self._prev_closed = n_closed
+            self._cooldown = 3
+            return
+
         # Only one trade at a time
         if self.position:
+            return
+
+        # ── FIX 3: Circuit breaker — stop if equity drops below 70% of start ──
+        if self.equity < INITIAL_CASH * 0.70:
             return
 
         price = self.data.Close[-1]
@@ -338,16 +377,16 @@ class HeatMapStrategy(Strategy):
         sl_dist = self.sl_pips * self.pip_sz
         tp_dist = self.tp_pips * self.pip_sz
 
-        # ── Entry ──────────────────────────────────
+        # ── Entry (FIX 4: fixed size=TRADE_SIZE, never resized by equity) ──
         if buy_score >= 3 and price > self.ema200[-1]:
             sl = price - sl_dist
             tp = price + tp_dist
-            self.buy(sl=sl, tp=tp)
+            self.buy(size=self.TRADE_SIZE, sl=sl, tp=tp)
 
         elif sell_score >= 3 and price < self.ema200[-1]:
             sl = price + sl_dist
             tp = price - tp_dist
-            self.sell(sl=sl, tp=tp)
+            self.sell(size=self.TRADE_SIZE, sl=sl, tp=tp)
 
 
 # ═══════════════════════════════════════════════════════
@@ -692,12 +731,17 @@ def main():
 
     # ── Run backtest ────────────────────────────────────
     print("\n[BACKTEST] Running...")
+    # margin=1/30: XAUUSD TRADE_SIZE=10 units * ~2000 price = ~20k notional.
+    # Without this param backtesting.py requires full notional cash and
+    # silently rejects ALL orders -> 0 trades. margin=1/30 (~3.3%) is
+    # standard metals CFD leverage and lets the fixed size fit on $10k.
     bt = Backtest(
         bt_df,
         HeatMapStrategy,
         cash=INITIAL_CASH,
-        commission=0.0,        # spread/commission can be added here
-        exclusive_orders=True,  # prevent stacking positions
+        commission=0.0,
+        exclusive_orders=True,
+        margin=1/30,
     )
     stats = bt.run()
 
